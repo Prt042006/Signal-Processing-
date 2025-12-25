@@ -1,0 +1,278 @@
+import serial
+import time
+import json
+import cv2
+import random
+import RPi.GPIO as GPIO
+import numpy as np
+import uuid
+from datetime import datetime
+from picamera2 import Picamera2
+from libcamera import controls
+from ultralytics import YOLO
+
+GPIO.setmode(GPIO.BCM)
+LED_PIN = 17
+GPIO.setup(LED_PIN, GPIO.OUT)
+
+# GSM SERIAL SETUP
+# ==============================================
+gsm = serial.Serial("/dev/serial0", 115200, timeout=1)
+
+#def send(cmd, delay=0.4):
+ #   gsm.write((cmd + "\r\n").encode())
+  #  time.sleep(delay)
+   # print(gsm.read(gsm.in_waiting).decode(errors="ignore"))
+ 
+def send_at(cmd, delay=1):
+    gsm.write((cmd + "\r\n").encode())
+    time.sleep(delay)
+    resp = gsm.read(gsm.in_waiting).decode(errors="ignore")
+    print(f"\nCMD: {cmd}\nRESP:\n{resp}")
+    return resp
+
+print("Waiting for GSM...")
+time.sleep(5)
+print("Trying AT+CRESET ...")
+resp = send_at("AT+CRESET", delay=3)
+
+# Agar CRESET supported nahi ho
+if "ERROR" in resp:
+    print("AT+CRESET not supported, using AT+CFUN=1,1")
+    send_at("AT+CFUN=1,1", delay=5)
+
+print("Waiting for GSM reboot...")
+time.sleep(12)
+send_at("AT")
+send_at("AT+CPIN?")
+
+resp = send_at("AT+CREG?")
+if ",1" not in resp and ",5" not in resp:
+    print("❌ Network not registered")
+    exit()
+
+# ---------- INTERNET ----------
+#APN = "your_apn_here"   # REAL APN likhna compulsory
+
+send_at('AT+CGDCONT=1,"IP","internet"')
+send_at("AT+CGACT=1,1")
+send_at("AT+CGATT?")
+send_at("AT+CGPADDR=1")
+
+def mqtt_hard_reset():
+    send_at("AT+CMQTTSTOP", 2)
+    send_at("AT+CMQTTREL=0", 1)
+    send_at("AT+CMQTTSTART", 2)
+
+resp = send_at("AT+CMQTTSTART")
+
+if "ERROR" in resp:
+    mqtt_hard_reset()    
+    
+client_id = f"pi_{random.randint(1000,9999)}"
+send_at(f'AT+CMQTTACCQ=0,"{client_id}"')
+send_at('AT+CMQTTCONNECT=0,"tcp://test.mosquitto.org:1883",60,1')
+
+
+# DEVICE IDENTIFICATION (MAC ADDRESS)
+# ==============================================
+def get_mac():
+    mac = uuid.getnode()
+    return ':'.join(f'{(mac >> ele) & 0xff:02x}' for ele in range(40, -8, -8))
+
+GATE = get_mac()
+
+GATE_ID = GATE.replace(":", "")
+
+print("Gate ID (MAC):", GATE_ID)
+
+# MQTT CONFIG
+# ==============================================
+MQTT_TOPIC = "{}/status".format(GATE_ID)
+print("MQTT_TOPIC:", MQTT_TOPIC)
+# YOLO MODEL
+# ==============================================
+MODEL_PATH = "/home/jack/yolov8n.pt"
+model = YOLO(MODEL_PATH)
+
+# HSV COLOR RANGES
+# ==============================================
+red_lower1 = np.array([0, 180, 180])
+red_upper1 = np.array([10, 255, 255])
+red_lower2 = np.array([170, 180, 180])
+red_upper2 = np.array([180, 255, 255])
+
+green_lower = np.array([40, 120, 60])
+green_upper = np.array([80, 255, 255])
+
+yellow_lower = np.array([20, 120, 60])
+yellow_upper = np.array([40, 255, 255])
+
+kernel = np.ones((5, 5), np.uint8)
+
+# TRAFFIC LIGHT COLOR DETECTION
+# ==============================================
+def detect_traffic_light_color(roi):
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    red_mask1 = cv2.inRange(hsv, red_lower1, red_upper1)
+    red_mask2 = cv2.inRange(hsv, red_lower2, red_upper2)
+    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+
+    green_mask = cv2.inRange(hsv, green_lower, green_upper)
+    yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
+
+    for mask in [red_mask, green_mask, yellow_mask]:
+        mask[:] = cv2.dilate(mask, kernel, iterations=1)
+        mask[:] = cv2.erode(mask, kernel, iterations=1)
+
+    red_ratio = (cv2.countNonZero(red_mask) / red_mask.size) * 100
+    green_ratio = (cv2.countNonZero(green_mask) / green_mask.size) * 100
+    yellow_ratio = (cv2.countNonZero(yellow_mask) / yellow_mask.size) * 100
+
+    max_ratio = max(red_ratio, green_ratio, yellow_ratio)
+
+    if max_ratio < 2:
+        return "OFF", 0
+    elif max_ratio == red_ratio:
+        return "ON", red_ratio   #RED
+    elif max_ratio == green_ratio:
+        return "OFF", green_ratio  #GREEN
+    else:
+        return "OFF", yellow_ratio   #YELLOW
+
+# ==============================================
+# MQTT PUBLISH FUNCTION
+
+#def send_at(cmd, delay=0.8, expect="OK"):
+ #   gsm.reset_input_buffer()
+  #  gsm.write((cmd + "\r\n").encode())
+   # time.sleep(delay)
+
+    #resp = gsm.read_all().decode(errors="ignore")
+#    print(f"\nCMD: {cmd}\nRESP:\n{resp}")
+
+ #   if expect and expect not in resp:
+  #      return False, resp
+   # return True, resp
+
+def mqtt_publish(color):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    msg = {
+        "gate_id": GATE_ID,
+        "status": color,
+        "timestamp": timestamp
+    }
+    print("\n========== MQTT DATA ==========")
+    print("Gate ID   :", msg["gate_id"])
+    print("Status    :", msg["status"])
+    print("Timestamp :", msg["timestamp"])
+    print("================================\n")
+
+    json_msg = json.dumps(msg)
+
+    send_at(f'AT+CMQTTTOPIC=0,{len(MQTT_TOPIC)}')
+    send_at(MQTT_TOPIC)
+
+    send_at(f'AT+CMQTTPAYLOAD=0,{len(json_msg)}')
+    send_at(json_msg)
+
+    send_at('AT+CMQTTPUB=0,1,60')
+    
+#def mqtt_reconnect():
+ #   send_at('AT+CMQTTDISC=0,120')
+  #  send_at('AT+CMQTTREL=0')
+   # send_at('AT+CMQTTSTOP')
+
+    #time.sleep(2)
+
+    #send_at('AT+CMQTTSTART')
+    #send_at('AT+CMQTTACCQ=0,"pi_client"')
+    #send_at(f'AT+CMQTTCONNECT=0,"tcp://{test.mosquitto.org}:{1883}",60,1')
+# ==============================================
+
+
+ 
+
+# CAMERA SETUP
+# ==============================================
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(
+    main={"format": "RGB888", "size": (640, 480)}
+)
+picam2.configure(config)
+
+picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
+picam2.set_controls({"AwbMode": controls.AwbModeEnum.Fluorescent})
+picam2.start()
+
+print("\n🚦 Live Traffic Light Detection Started")
+print("Press 'q' to quit\n")
+
+# MAIN LOOP
+# ==============================================
+last_publish = None
+light_color = None
+while True:
+    frame = picam2.capture_array()
+    results = model(frame, conf=0.25, imgsz=640, verbose=False)
+
+    for r in results:
+        for box in r.boxes:
+            cls = int(box.cls[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            if model.names[cls] == "traffic light":
+                h, w = frame.shape[:2]
+                pad = 5
+
+                roi = frame[
+                    max(0, y1 - pad):min(h, y2 + pad),
+                    max(0, x1 - pad):min(w, x2 + pad)
+                ]
+
+                light_color, conf = detect_traffic_light_color(roi)
+
+                if light_color == "ON": #RED
+                    color = (0, 0, 255)
+                elif light_color == "GREEN":
+                    color = (0, 255, 0)
+                elif light_color == "YELLOW":
+                    color = (0, 255, 255)
+                else:
+                    color = (128, 128, 128)
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                cv2.putText(
+                    frame,
+                    f"{light_color} {conf:.1f}%",
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    color,
+                    2)
+                
+     #       else:
+      #          light_color="No Tr_light detect"
+       #         
+        #        if light_color != last_publish:
+         #           print ("No traffic light detected")
+          #          mqtt_publish(light_color)
+           #         last_publish = light_color
+                
+    #cv2.imshow("Live Traffic Light Detection", frame)
+    GPIO.output(LED_PIN, GPIO.HIGH)
+    #print ("loop")
+    if light_color != last_publish :
+        mqtt_publish(light_color)
+        last_publish = light_color
+        #GPIO.output(LED_PIN, GPIO.LOW)
+    #time.sleep(20)
+    #if cv2.waitKey(1) & 0xFF == ord('q'):
+     #   break
+
+# CLEANUP
+# ==============================================
+        #picam2.stop()
+        #cv2.destroyAllWindows()
